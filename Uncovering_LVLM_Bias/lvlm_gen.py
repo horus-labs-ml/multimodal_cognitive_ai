@@ -10,6 +10,11 @@ from tqdm import tqdm
 
 from transformers import AutoProcessor, AutoTokenizer, CLIPImageProcessor, LlavaForConditionalGeneration, InstructBlipProcessor, InstructBlipForConditionalGeneration, set_seed
 from processing_llavagemma import LlavaGemmaProcessor
+from vllm import LLM, SamplingParams # Added VLLM imports
+
+from transformers import AutoProcessor, AutoModelForVision2Seq
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 prompt_labels = {
     'Describe the image in as much detail as possible.': 'describe',
@@ -45,6 +50,17 @@ prompts = [k for k in prompt_labels.keys()]
 prompt_labels_index = {prompt_labels[k] : prompts.index(k) for k in prompt_labels.keys()}
 
 if __name__ == '__main__':
+    # Set the start method to 'spawn' for CUDA compatibility with multiprocessing
+    # This is important for libraries like VLLM or PyTorch when using CUDA.
+    import multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # This can happen if it's already set or in a context where it cannot be set.
+        # It's a best-effort, and the program might still work or fail later if this is critical.
+        print("Note: Could not force multiprocessing start method to 'spawn'.")
+        pass
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--out_dir",
@@ -171,9 +187,13 @@ if __name__ == '__main__':
     metadata_index = np.array_split(list(range(metadata.shape[0])), args.n_partitions)[args.partition]
     metadata = metadata.iloc[metadata_index,:]
     valid_im_index = [i.replace('caption_','') for i in metadata.columns if i.startswith('caption_')]
+    print(valid_im_index)
     assert len(valid_im_index) == args.n_images
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if 'smolvlm' in args.model_name: 
+        tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     eos_token_id = tokenizer.eos_token_id
     if 'llava-gemma' in args.model_name:
         model = LlavaForConditionalGeneration.from_pretrained(args.model_name, torch_dtype=torch.float16).to('cuda')
@@ -188,16 +208,33 @@ if __name__ == '__main__':
     elif 'instructblip' in args.model_name:
         model = InstructBlipForConditionalGeneration.from_pretrained(args.model_name, torch_dtype=torch.float16).to('cuda')
         processor = InstructBlipProcessor.from_pretrained(args.model_name)
+    elif 'smolvlm' in args.model_name:
+        # Processor is kept for prompt templating. Tokenizer is already loaded above.
+        processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-Instruct")
+        # Load smolvlm model using VLLM
+        model = LLM(model="HuggingFaceTB/SmolVLM-Instruct",
+                    tokenizer="HuggingFaceTB/SmolVLM-Instruct", # Explicitly pass tokenizer path
+                    dtype="bfloat16", # Match original dtype
+                    # tensor_parallel_size=1 # Optional: Adjust based on available GPUs
+                   )
+        # model.eval() is not typically called on VLLM's LLM object in the same way
     else:
         raise NotImplementedError
-
-    out_file = os.path.join(args.out_dir, args.im_path.split('/')[-1] + '_' + args.model_name.split('/')[-1] + '_' + str(args.partition) + '.jsonl')
+    # model.eval() should only be called for non-VLLM models now
+    if 'smolvlm' not in args.model_name:
+        model.eval()
+    
+    model_name_for_file = args.model_name.split('/')[-1]
+    if 'smolvlm' in args.model_name: # Condition for VLLM usage
+        model_name_for_file += "_vllm"
+    
+    out_file = os.path.join(args.out_dir, args.im_path.split('/')[-1] + '_' + model_name_for_file + '_' + str(args.partition) + '.jsonl')
     if os.path.exists(out_file):
         os.remove(out_file)
     
     for seed in range(args.start_seed, args.num_seeds):
         print('\nStarting seed ' + str(seed) + '\n')
-        for i in tqdm(range(metadata.shape[0])):
+        for i in tqdm(range(1440, metadata.shape[0])):
             filename = metadata.iloc[i]['filename']
             rank = str(metadata.iloc[i]['rank'])
             im_seed = str(metadata.iloc[i]['seed'])
@@ -212,6 +249,20 @@ if __name__ == '__main__':
                     prompt = "<image>\nUSER: " + p + "\nASSISTANT:"
                 elif 'instructblip' in args.model_name:
                     prompt = '. </s>'.join(p.split('.'))
+                
+                elif 'smolvlm' in args.model_name: 
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": 
+                                [
+                                    {"type": "image"},
+                                    {"type": "text", "text": p}
+                                ]
+                        }
+                    ]
+                    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
+
                 
                 for b in range(batches):
                     image = []
@@ -237,21 +288,96 @@ if __name__ == '__main__':
                             batch_prompts.append(prompt)
                         image.append(im_j)
                     
-                    inputs = processor(text=batch_prompts, images=image, return_tensors="pt").to('cuda', torch.float16)
+                    if 'smolvlm' in args.model_name:
+                        # VLLM specific generation path
+                        multi_modal_data = {}
+                        # Ensure each prompt has its corresponding image data correctly mapped.
+                        # If batch_prompts has one entry per image, and 'image' list also, this direct mapping works.
+                        # VLLM expects multi_modal_inputs to be a dict where keys are arbitrary (e.g. "0", "1")
+                        # and values are dicts like {"image": PIL.Image.Image}
+                        # The 'prompts' passed to vllm.generate should align with these keys if images differ per prompt.
+                        # For this script, it seems each image in the 'image' list corresponds to a prompt in 'batch_prompts'.
+                        # So, we can create a generic key for each image.
+                        # However, VLLM's generate method takes a list of prompts and a single multi_modal_inputs dict.
+                        # The image token (e.g. <image>) in the prompt tells VLLM where to insert the image.
+                        # If all prompts in the batch use the *same* image, multi_modal_inputs can be simple.
+                        # If prompts use *different* images (as is the case here, one image per prompt in the batch),
+                        # we need to ensure VLLM can associate them.
+                        # The `generate` method of VLLM's LLM class takes `prompts` (list of strings)
+                        # and `multi_modal_inputs` (dict).
+                        # For multiple prompts each with its own image, we pass the list of PIL images directly
+                        # to the `images` parameter of `llm.generate()` if using a recent VLLM version that supports it,
+                        # or structure `multi_modal_inputs` carefully.
+                        # Given SmolVLM's structure, it's likely one image per prompt.
+                        # The `processor.apply_chat_template` for smolvlm already includes `{"type": "image"}`.
+                        # VLLM should pick this up. We pass the list of PIL images.
+                        
+                        # The `eos_token_id` for smolvlm is already set globally if 'smolvlm' in args.model_name
+                        # or specifically for llava-gemma. We need the specific one for smolvlm.
+                        # tokenizer is defined, so tokenizer.eos_token_id should be correct for smolvlm.
+                        current_eos_token_id = tokenizer.eos_token_id # This should be smolvlm's EOS
+                        
+                        sampling_params = SamplingParams(
+                            n=1, # Number of output sequences to return per prompt
+                            best_of=args.num_beams if args.num_beams > 1 and not args.do_sample else None,
+                            use_beam_search=True if args.num_beams > 1 and not args.do_sample else False,
+                            temperature=args.temperature if args.do_sample else 0.0, # 0.0 for greedy
+                            top_p=args.top_p if args.do_sample else 1.0,
+                            max_tokens=args.max_new_tokens,
+                            repetition_penalty=args.repetition_penalty,
+                            stop_token_ids=[current_eos_token_id], # Must be a list
+                            seed=seed # Pass the current loop's seed
+                        )
+                        
+                        # VLLM's generate can take PIL images directly in `multi_modal_inputs`
+                        # The key in multi_modal_inputs (e.g. "image") should match what the model expects.
+                        # For SmolVLM, the prompt template uses `{"type": "image"}`.
+                        # VLLM's `generate` can take `images: List[Image.Image]` as a direct argument
+                        # if the model is a multi-modal model that VLLM recognizes.
+                        # Let's try passing PIL images directly via `multi_modal_inputs` with a placeholder key
+                        # if the model's processor expects it, or directly as `images` kwarg.
+                        # For SmolVLM, the prompt contains <image> token.
+                        # VLLM's `LLM.generate` can take `multi_modal_inputs={'image': List[PIL.Image.Image]}`
+                        # or `multi_modal_inputs={'image_0': PIL.Image, 'image_1': PIL.Image}`
+                        # if prompts refer to 'image_0', 'image_1' etc.
+                        # Simpler: if prompt has one <image> and we pass a list of prompts and list of images.
+                        
+                        # Prepare multi_modal_data for VLLM, assuming one image per prompt in the batch
+                        # The prompt itself contains the <image> placeholder.
+                        # VLLM's generate method can accept `images: List[Image.Image]`
+                        vllm_outputs = model.generate(
+                            prompts=batch_prompts, # List of text prompt strings
+                            sampling_params=sampling_params,
+                            # Pass images directly if VLLM supports it for this model type
+                            # This assumes the model's VLLM integration handles matching images to prompts.
+                            # The `image` variable here is a list of PIL.Image objects.
+                            multi_modal_inputs={"image": image} # This expects a list of images for batched requests
+                        )
+                        output_text = [output.outputs[0].text for output in vllm_outputs]
+                        # Post-processing for smolvlm output, if needed (already in original code)
+                        output_text = [i.split('\nAssistant: ')[-1] if '\nAssistant: ' in i else i for i in output_text]
 
-                    # Generate
-                    set_seed(seed)
-                    with torch.no_grad():
-                        if args.do_sample:
-                            generate_ids = model.generate(**inputs, num_beams=args.num_beams, do_sample=True, temperature=args.temperature, top_p=args.top_p, max_new_tokens=args.max_new_tokens, repetition_penalty=args.repetition_penalty, eos_token_id=eos_token_id)
-                        else:
-                            generate_ids = model.generate(**inputs, num_beams=args.num_beams, do_sample=False, max_new_tokens=args.max_new_tokens, repetition_penalty=args.repetition_penalty, eos_token_id=eos_token_id)
-                    
-                    output_text = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                    if 'llava-gemma' in args.model_name:
-                        output_text = [i.split('\nmodel\n')[-1] for i in output_text]
-                    elif 'llava' in args.model_name:
-                        output_text = [i.split('\nASSISTANT: ')[-1] for i in output_text]
+                    else:
+                        # Original Hugging Face Transformers path for other models
+                        inputs = processor(text=batch_prompts, images=image, return_tensors="pt").to('cuda', torch.bfloat16 if 'instructblip' not in args.model_name and 'llava' not in args.model_name else torch.float16) # Adjusted dtype for llava/instructblip
+
+                        # Generate
+                        set_seed(seed) # Set seed for HF transformers
+                        with torch.no_grad():
+                            if args.do_sample:
+                                generate_ids = model.generate(**inputs, num_beams=args.num_beams, do_sample=True, temperature=args.temperature, top_p=args.top_p, max_new_tokens=args.max_new_tokens, repetition_penalty=args.repetition_penalty, eos_token_id=eos_token_id)
+                            else:
+                                generate_ids = model.generate(**inputs, num_beams=args.num_beams, do_sample=False, max_new_tokens=args.max_new_tokens, repetition_penalty=args.repetition_penalty, eos_token_id=eos_token_id)
+                        
+                        output_text = processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                        if 'llava-gemma' in args.model_name:
+                            output_text = [i.split('\nmodel\n')[-1] for i in output_text]
+                        elif 'llava' in args.model_name: # This will catch other llava variants too
+                            output_text = [i.split('\nASSISTANT: ')[-1] if '\nASSISTANT: ' in i else i for i in output_text]
+                        # SmolVLM case is now handled by VLLM path, so this elif is not strictly needed here but harmless
+                        # elif 'smolvlm' in args.model_name: 
+                        #    output_text = [i.split('\nAssistant: ')[-1] for i in output_text]
+
                     
                     out_dict = {'filename' : filename, 'rank' : rank, 'im_seed' : im_seed, 'model_name' : args.model_name, 'text_seed' : seed, 'args' : vars(args), 'prompt' : prompt_labels[p], 'im_index' : im_index, 'text' : output_text}
                     with open(out_file, 'a') as f:

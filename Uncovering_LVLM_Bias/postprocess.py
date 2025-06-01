@@ -31,26 +31,26 @@ if __name__ == '__main__':
     out_df = []
     k = 0
     for out_dict in tqdm(out_list):
-        df = {i: out_dict[i] for i in out_dict.keys() if i not in ['args', 'text']}
+        df = {i: out_dict[i] for i in out_dict.keys() if i not in ['args', 'generated_texts']}
         # df = {**df, **out_dict['args']}
         if 'args' in out_dict.keys():
             df['do_sample'] = out_dict['args']['do_sample']
-        df['text'] = out_dict['text']
-        if type(out_dict['text']) == list:
-            df = pd.DataFrame(df, index=list(range(k,k+len(out_dict['text']))))
-            k+=len(out_dict['text'])
+        df['generated_texts'] = out_dict['generated_texts']
+        if type(out_dict['generated_texts']) == list:
+            df = pd.DataFrame(df, index=list(range(k,k+len(out_dict['generated_texts']))))
+            k+=len(out_dict['generated_texts'])
         else:
             df = pd.DataFrame(df,index=[k])
             k+=1
         out_df.append(df)
 
     out_df = pd.concat(out_df)
-    if out_df['text_seed'].value_counts().std() != 0:
+    if out_df['text_gen_seed'].value_counts().std() != 0:
         warnings.warn('The number of generations per text seed differs:')
-        print(out_df['text_seed'].value_counts())
+        print(out_df['text_gen_seed'].value_counts())
 
-    out_df['text_seed'] = out_df['text_seed'].astype(str)
-    out_df = out_df.pivot(columns=['prompt', 'text_seed'], values='text', index=[i for i in out_df.columns if i not in ['prompt', 'text_seed','text','response']])
+    out_df['text_gen_seed'] = out_df['text_gen_seed'].astype(str)
+    out_df = out_df.pivot(columns=['prompt_label', 'text_gen_seed'], values='generated_texts', index=[i for i in out_df.columns if i not in ['prompt_label', 'text_gen_seed','generated_texts','response']])
     out_df = out_df.reset_index()
     out_df.columns = ['_'.join(col) for col in out_df.columns.values]
     out_df = out_df.rename(columns = {i : i[:-1] for i in out_df.columns if i.endswith('_')})
@@ -90,10 +90,10 @@ if __name__ == '__main__':
         else:
             raise NotImplementedError
 
-        out_df['im_index'] = out_df['im_index'].astype(str)
-        attributes['im_index'] = attributes['im_index'].astype(str)
-        out_df = pd.merge(out_df, attributes, how = 'left', on = 'im_index')
+        out_df['im_indices_in_batch'] = out_df['im_indices_in_batch'].astype(str)
+        attributes['im_indices_in_batch'] = attributes['im_index'].astype(str)
+        out_df = pd.merge(out_df, attributes, how = 'left', on = 'im_indices_in_batch')
 
-        out_df['subject'] = out_df.apply(lambda x: x['filename'][x['filename'].index(x['dataset_type']):].replace(x['dataset_type'] + '_',''), axis=1)
+        out_df['subject'] = out_df.apply(lambda x: x['filename_prefix'][x['filename_prefix'].index(x['dataset_type']):].replace(x['dataset_type'] + '_',''), axis=1)
 
     out_df.to_csv(os.path.join(args.out_dir, 'generations.csv'), index=False)

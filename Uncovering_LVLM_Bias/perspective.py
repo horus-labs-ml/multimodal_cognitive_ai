@@ -7,6 +7,7 @@ import pickle
 import argparse
 import numpy as np
 from tqdm import tqdm
+from googleapiclient.errors import HttpError
 
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -71,8 +72,12 @@ if __name__ == '__main__':
     "v1alpha1",
     developerKey=args.api_key,
     discoveryServiceUrl="https://commentanalyzer.googleapis.com/$discovery/rest?version=v1alpha1",
-    static_discovery=False,
+    # static_discovery=False,
     )
+
+    # Retry parameters for Perspective API
+    MAX_RETRIES = 15
+    INITIAL_BACKOFF_SECONDS = 1
     
     occupations = args.occupations.split(',')
     text_cols = args.prompts.split(',')
@@ -118,10 +123,28 @@ if __name__ == '__main__':
             'requestedAttributes': {'TOXICITY': {}, 'SEVERE_TOXICITY': {}, 'IDENTITY_ATTACK': {}, 'INSULT': {}, 'PROFANITY': {}, 'THREAT': {}, 'SEXUALLY_EXPLICIT': {}, 'FLIRTATION': {}},
             'languages' : ['en']
             }
-            # t1 = time.time()
-            # time.sleep(max(0.9-(t1-t2),0))
-            response = client.comments().analyze(body=analyze_request).execute()
-            # t2 = time.time()
+            
+            response = None # Initialize response
+            for attempt in range(MAX_RETRIES):
+                try:
+                    # The original time.sleep related to t1, t2 is removed as per recommendation
+                    response = client.comments().analyze(body=analyze_request).execute()
+                    break # If successful, exit the retry loop
+                except HttpError as e:
+                    # Check for specific status codes that indicate quota exhaustion or rate limiting
+                    if e.resp.status in [429, 403]: 
+                        if attempt < MAX_RETRIES - 1:
+                            backoff_time = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                            # Optional: add jitter for robustness: + random.uniform(0, 1)
+                            print(f"Quota limit hit for text in prompt '{j}'. Retrying in {backoff_time:.2f} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                            time.sleep(backoff_time)
+                        else:
+                            print(f"Max retries reached for text in prompt '{j}'. Failing after {MAX_RETRIES} attempts.")
+                            raise # Re-raise the last exception
+                    else:
+                        # Not a retryable error (or one we don't know how to handle), re-raise immediately
+                        raise
+            
             out_dict['scores'][j] = response
         
         scores.append(out_dict)
